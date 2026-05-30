@@ -9,8 +9,7 @@ from typing import Dict, List, Optional, Set
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from langchain.agents import Tool, initialize_agent
-from langchain.llms import OpenAI
+from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
 from supabase import create_client
 
 
@@ -193,7 +192,7 @@ class ListingScraper:
             return "Dealer"
         return None
 
-    def _parse_make_model(self, text: str) -> (Optional[str], Optional[str]):
+    def _parse_make_model(self, text: str) -> tuple[Optional[str], Optional[str]]:
         lower = text.lower()
         if "suzuki alto" in lower:
             return "Suzuki", "Alto"
@@ -332,7 +331,7 @@ class DealScorer:
                     return value
         return None
 
-    def _summarize_takeaways(self, listing: Listing, market_value: int, score: int) -> (str, str):
+    def _summarize_takeaways(self, listing: Listing, market_value: int, score: int) -> tuple[str, str]:
         bullets = []
         if listing.seller_type == "Private":
             bullets.append("Private seller improves negotiation and resale clarity.")
@@ -355,33 +354,62 @@ class DealScorer:
 
 
 class FormatAgent:
-    def __init__(self, openai_api_key: str):
-        self.llm = OpenAI(
-            model_name="gpt-4o-mini",
-            temperature=0.2,
-            openai_api_key=openai_api_key,
-        )
-        self.tools = [
-            Tool(
-                name="summarize_listing",
-                func=self._summarize_listing,
-                description="Create short bullets for why to buy and risk from the listing data.",
-            )
-        ]
-        self.agent = initialize_agent(
-            self.tools,
-            self.llm,
-            agent="zero-shot-react-description",
-            verbose=False,
+    def __init__(self, anthropic_api_key: str):
+        self.client = Anthropic(api_key=anthropic_api_key)
+        self.model = "claude-3.1"
+        self.temperature = 0.2
+
+    def _build_prompt(self, listing: Listing, market_value: int, score: int) -> str:
+        return (
+            "You are Claude, an expert used car analyst for Sri Lanka. "
+            "Given the listing details, return exactly two concise bullets for 'Why Buy' and exactly one concise bullet for 'Risks'. "
+            "Answer only with valid JSON containing keys 'why_buy' and 'risks', where 'why_buy' is a string with two bullet lines separated by '\n' and 'risks' is a string with one bullet line.\n\n"
+            "Listing details:\n"
+            f"Title: {listing.title}\n"
+            f"Year: {listing.year or 'unknown'}\n"
+            f"Make: {listing.make or 'unknown'}\n"
+            f"Model: {listing.model or 'unknown'}\n"
+            f"Asking Price: {listing.asking_price or 'unknown'}\n"
+            f"Market Value: {market_value}\n"
+            f"Mileage: {listing.mileage or 'unknown'} km\n"
+            f"Transmission: {listing.transmission or 'unknown'}\n"
+            f"Location: {listing.location or 'unknown'}\n"
+            f"Seller Type: {listing.seller_type or 'unknown'}\n"
+            f"Distress signal: {'yes' if listing.distress else 'no'}\n"
+            f"Score: {score}\n"
         )
 
-    def _summarize_listing(self, listing: Dict) -> str:
-        prompt = (
-            "Review the listing details and return exactly two concise 'Why Buy' bullets and one 'Risks' bullet, "
-            "formatted as JSON with keys 'why_buy' and 'risks'.\n\n" + json.dumps(listing)
+    def _parse_response(self, text: str) -> Dict[str, str]:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            raise ValueError("No JSON object found in Anthropic response")
+        return json.loads(match.group(0))
+
+    def enrich_deal(self, deal: Deal) -> Deal:
+        prompt = self._build_prompt(deal.listing, deal.market_value, deal.score)
+        response = self.client.completions.create(
+            model=self.model,
+            prompt=HUMAN_PROMPT + prompt + AI_PROMPT,
+            max_tokens_to_sample=400,
+            temperature=self.temperature,
         )
-        response = self.llm(prompt)
-        return response.strip()
+        text = response.completion.strip()
+        try:
+            parsed = self._parse_response(text)
+            why_buy = parsed.get("why_buy", deal.why_buy)
+            risks = parsed.get("risks", deal.risks)
+        except Exception:
+            why_buy = deal.why_buy
+            risks = deal.risks
+        return Deal(
+            listing=deal.listing,
+            market_value=deal.market_value,
+            roi=deal.roi,
+            est_profit=deal.est_profit,
+            score=deal.score,
+            why_buy=why_buy,
+            risks=risks,
+        )
 
     def format_payload(self, deals: List[Deal]) -> Dict:
         total_ask = sum(deal.listing.asking_price or 0 for deal in deals)
@@ -392,7 +420,7 @@ class FormatAgent:
                     "description": (
                         f"**Date:** {datetime.utcnow().strftime('%Y-%m-%d')} | "
                         f"**Deals:** {len(deals)} | **Total Ask:** LKR {total_ask:,} | "
-                        "Top Sri Lanka under-budget deals"
+                        "Analyzed with Claude and Supabase"
                     ),
                     "color": 16096779,
                     "footer": {"text": "Syndicate Solutions Auto-Scanner"},
@@ -430,12 +458,12 @@ class DiscordPoster:
 
 
 class CarDealScanner:
-    def __init__(self, supabase_url: str, supabase_key: str, openai_key: str, discord_webhook: str, serpapi_key: Optional[str] = None):
+    def __init__(self, supabase_url: str, supabase_key: str, anthropic_key: str, discord_webhook: str, serpapi_key: Optional[str] = None):
         self.store = SupabaseStore(supabase_url, supabase_key)
         self.search = SearchEngine(serpapi_key)
         self.scraper = ListingScraper()
         self.scorer = DealScorer()
-        self.formatter = FormatAgent(openai_key)
+        self.formatter = FormatAgent(anthropic_key)
         self.discord = DiscordPoster(discord_webhook)
 
     def run(self, dry_run: bool = False) -> None:
@@ -456,12 +484,13 @@ class CarDealScanner:
             }
             print(json.dumps(payload, indent=2))
             return
-        formatted = self.formatter.format_payload(top_deals)
+        enriched_deals = [self.formatter.enrich_deal(deal) for deal in top_deals]
+        formatted = self.formatter.format_payload(enriched_deals)
         print(json.dumps(formatted, indent=2))
         if not dry_run:
             self.discord.post(formatted["header"])
             self.discord.post(formatted["deals"])
-            self.store.add_seen_ids([deal.listing.listing_id for deal in top_deals])
+            self.store.add_seen_ids([deal.listing.listing_id for deal in enriched_deals])
 
     def _collect_candidate_urls(self, seen_ids: Set[str]) -> List[str]:
         urls = []
@@ -506,7 +535,7 @@ def load_config() -> Dict[str, str]:
     return {
         "SUPABASE_URL": os.getenv("SUPABASE_URL", ""),
         "SUPABASE_KEY": os.getenv("SUPABASE_KEY", ""),
-        "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
+        "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", ""),
         "DISCORD_WEBHOOK_URL": os.getenv("DISCORD_WEBHOOK_URL", ""),
         "SERPAPI_API_KEY": os.getenv("SERPAPI_API_KEY", ""),
     }
@@ -514,13 +543,13 @@ def load_config() -> Dict[str, str]:
 
 if __name__ == "__main__":
     config = load_config()
-    missing = [k for k, v in config.items() if k != "SERPAPI_API_KEY" and not v]
+    missing = [k for k, v in config.items() if k not in {"SERPAPI_API_KEY"} and not v]
     if missing:
         raise SystemExit(f"Missing required env vars: {', '.join(missing)}")
     scanner = CarDealScanner(
         supabase_url=config["SUPABASE_URL"],
         supabase_key=config["SUPABASE_KEY"],
-        openai_key=config["OPENAI_API_KEY"],
+        anthropic_key=config["ANTHROPIC_API_KEY"],
         discord_webhook=config["DISCORD_WEBHOOK_URL"],
         serpapi_key=config.get("SERPAPI_API_KEY"),
     )

@@ -15,7 +15,7 @@ Create a `.env` file with:
 ```env
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_KEY=your-supabase-service-role-key
-OPENAI_API_KEY=your-openai-key
+ANTHROPIC_API_KEY=your-anthropic-key
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 SERPAPI_API_KEY=your-serpapi-key
 ```
