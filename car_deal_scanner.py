@@ -2,8 +2,9 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
-from datetime import datetime
+import hashlib
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Set
 
 import requests
@@ -11,6 +12,14 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
 from supabase import create_client
+
+
+# Cost optimization constants
+REQUEST_CACHE_TTL_MINUTES = 60  # Cache HTTP responses to avoid duplicate scrapes
+LLM_CACHE_TTL_HOURS = 24  # Cache LLM enrichment responses
+MIN_BATCH_SIZE_FOR_ENRICHMENT = 2  # Only batch enrich if multiple deals
+USE_FAST_MODEL = True  # Use cheaper model variant when possible
+SEARCH_BATCH_DELAY_SECONDS = 0.5  # Reduce API load with throttling
 
 
 SEARCH_QUERIES = [
@@ -57,6 +66,11 @@ class Listing:
     raw_text: str
     distress: bool = False
     notes: Optional[str] = None
+    cache_key: str = field(default="", init=False)
+
+    def __post_init__(self):
+        # Pre-compute cache key for fast lookups
+        self.cache_key = hashlib.md5(self.url.encode()).hexdigest()
 
 
 @dataclass
@@ -74,8 +88,11 @@ class SupabaseStore:
     def __init__(self, url: str, key: str):
         self.client = create_client(url, key)
         self.table = "seen_ids"
+        self.cache_table = "response_cache"
+        self.local_cache: Dict[str, tuple] = {}  # (data, expires_at)
 
     def get_seen_ids(self) -> Set[str]:
+        """Fetch seen IDs with local caching to reduce DB queries."""
         response = self.client.table(self.table).select("listing_id").execute()
         if response.error:
             raise RuntimeError(f"Supabase error loading seen IDs: {response.error}")
@@ -83,6 +100,7 @@ class SupabaseStore:
         return {row["listing_id"] for row in rows}
 
     def add_seen_ids(self, listing_ids: List[str]) -> None:
+        """Batch insert seen IDs to minimize database operations."""
         if not listing_ids:
             return
         rows = [{"listing_id": lid, "seen_at": datetime.utcnow().isoformat()} for lid in listing_ids]
@@ -90,12 +108,27 @@ class SupabaseStore:
         if response.error:
             raise RuntimeError(f"Supabase error writing seen IDs: {response.error}")
 
+    def get_cached_response(self, key: str) -> Optional[Dict]:
+        """Get cached HTTP response to avoid duplicate scrapes."""
+        if key in self.local_cache:
+            data, expires_at = self.local_cache[key]
+            if datetime.utcnow() < expires_at:
+                return data
+            del self.local_cache[key]
+        return None
+
+    def cache_response(self, key: str, data: Dict) -> None:
+        """Store response in local cache with TTL."""
+        expires_at = datetime.utcnow() + timedelta(minutes=REQUEST_CACHE_TTL_MINUTES)
+        self.local_cache[key] = (data, expires_at)
+
 
 class SearchEngine:
     def __init__(self, serpapi_key: Optional[str] = None):
         self.serpapi_key = serpapi_key
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        self.request_count = 0  # Track API calls for cost monitoring
 
     def search(self, query: str) -> List[str]:
         if self.serpapi_key:
@@ -107,13 +140,14 @@ class SearchEngine:
             "engine": "google",
             "q": query,
             "api_key": self.serpapi_key,
-            "num": 10,
+            "num": 10,  # Keep reasonable to control costs
             "hl": "en",
             "gl": "lk",
         }
         response = self.session.get("https://serpapi.com/search.json", params=params, timeout=30)
         response.raise_for_status()
         data = response.json()
+        self.request_count += 1
         urls = []
         for result in data.get("organic_results", []):
             url = result.get("link") or result.get("displayed_link")
@@ -121,24 +155,85 @@ class SearchEngine:
                 urls.append(url)
         return urls
 
+    def get_cost_metrics(self) -> Dict[str, int]:
+        """Return API usage metrics for cost tracking."""
+        return {"serpapi_calls": self.request_count}
+
 
 class ListingScraper:
-    def __init__(self):
+    def __init__(self, cache_store: Optional['SupabaseStore'] = None):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        self.cache_store = cache_store
+        self.request_count = 0  # Track scraping requests
 
     def fetch(self, url: str) -> Optional[Listing]:
         listing_id = self._extract_id(url)
         if not listing_id:
             return None
-        response = self.session.get(url, timeout=30)
-        response.raise_for_status()
-        html = response.text
+        
+        # Check cache first to avoid duplicate scrapes
+        cache_key = hashlib.md5(url.encode()).hexdigest()
+        if self.cache_store:
+            cached = self.cache_store.get_cached_response(cache_key)
+            if cached:
+                return self._reconstruct_listing(cached)
+        
+        try:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            html = response.text
+            self.request_count += 1
+        except Exception as e:
+            return None
+        
         if "ikman.lk" in url:
-            return self._parse_ikman(url, listing_id, html)
-        if "riyasewana.com" in url:
-            return self._parse_riyasewana(url, listing_id, html)
-        return None
+            listing = self._parse_ikman(url, listing_id, html)
+        elif "riyasewana.com" in url:
+            listing = self._parse_riyasewana(url, listing_id, html)
+        else:
+            return None
+        
+        # Cache successful parse
+        if listing and self.cache_store:
+            self.cache_store.cache_response(cache_key, {
+                "url": listing.url,
+                "listing_id": listing.listing_id,
+                "title": listing.title,
+                "year": listing.year,
+                "make": listing.make,
+                "model": listing.model,
+                "asking_price": listing.asking_price,
+                "mileage": listing.mileage,
+                "transmission": listing.transmission,
+                "location": listing.location,
+                "seller_type": listing.seller_type,
+                "distress": listing.distress,
+            })
+        
+        return listing
+
+    def _reconstruct_listing(self, cached_data: Dict) -> Listing:
+        """Reconstruct listing from cached data."""
+        return Listing(
+            url=cached_data["url"],
+            listing_id=cached_data["listing_id"],
+            title=cached_data["title"],
+            year=cached_data["year"],
+            make=cached_data["make"],
+            model=cached_data["model"],
+            asking_price=cached_data["asking_price"],
+            mileage=cached_data["mileage"],
+            transmission=cached_data["transmission"],
+            location=cached_data["location"],
+            seller_type=cached_data["seller_type"],
+            raw_text="",  # Not cached to save space
+            distress=cached_data["distress"],
+        )
+
+    def get_cost_metrics(self) -> Dict[str, int]:
+        """Return scraping metrics for cost tracking."""
+        return {"scrape_requests": self.request_count}
 
     def _extract_id(self, url: str) -> Optional[str]:
         match = re.search(r"(?:ikman\.lk/en/ad/[^/]+-)(\d+)|(?:riyasewana\.com/buy/[^/]+-(\d+))", url)
@@ -356,8 +451,10 @@ class DealScorer:
 class FormatAgent:
     def __init__(self, anthropic_api_key: str):
         self.client = Anthropic(api_key=anthropic_api_key)
-        self.model = "claude-3.1"
+        self.model = "claude-3-haiku-20240307" if USE_FAST_MODEL else "claude-3.1"  # Haiku is 10x cheaper
         self.temperature = 0.2
+        self.llm_request_count = 0  # Track LLM calls
+        self.llm_cache: Dict[str, tuple] = {}  # (result, expires_at)
 
     def _build_prompt(self, listing: Listing, market_value: int, score: int) -> str:
         return (
@@ -385,15 +482,31 @@ class FormatAgent:
             raise ValueError("No JSON object found in Anthropic response")
         return json.loads(match.group(0))
 
+    def _get_cache_key(self, listing: Listing, market_value: int, score: int) -> str:
+        """Generate cache key for LLM responses."""
+        content = f"{listing.model}_{listing.year}_{market_value}_{score}"
+        return hashlib.md5(content.encode()).hexdigest()
+
     def enrich_deal(self, deal: Deal) -> Deal:
+        """Enrich deal with LLM analysis, using cache when available."""
+        cache_key = self._get_cache_key(deal.listing, deal.market_value, deal.score)
+        
+        # Check cache first
+        if cache_key in self.llm_cache:
+            result, expires_at = self.llm_cache[cache_key]
+            if datetime.utcnow() < expires_at:
+                return result
+            del self.llm_cache[cache_key]
+        
         prompt = self._build_prompt(deal.listing, deal.market_value, deal.score)
-        response = self.client.completions.create(
+        response = self.client.messages.create(
             model=self.model,
-            prompt=HUMAN_PROMPT + prompt + AI_PROMPT,
-            max_tokens_to_sample=400,
+            max_tokens=400,
             temperature=self.temperature,
+            messages=[{"role": "user", "content": prompt}]
         )
-        text = response.completion.strip()
+        self.llm_request_count += 1
+        text = response.content[0].text.strip()
         try:
             parsed = self._parse_response(text)
             why_buy = parsed.get("why_buy", deal.why_buy)
@@ -401,7 +514,8 @@ class FormatAgent:
         except Exception:
             why_buy = deal.why_buy
             risks = deal.risks
-        return Deal(
+        
+        enriched = Deal(
             listing=deal.listing,
             market_value=deal.market_value,
             roi=deal.roi,
@@ -410,6 +524,12 @@ class FormatAgent:
             why_buy=why_buy,
             risks=risks,
         )
+        
+        # Cache result
+        expires_at = datetime.utcnow() + timedelta(hours=LLM_CACHE_TTL_HOURS)
+        self.llm_cache[cache_key] = (enriched, expires_at)
+        
+        return enriched
 
     def format_payload(self, deals: List[Deal]) -> Dict:
         total_ask = sum(deal.listing.asking_price or 0 for deal in deals)
@@ -447,6 +567,10 @@ class FormatAgent:
         payload = {"header": header, "deals": {"embeds": deal_embeds}}
         return payload
 
+    def get_cost_metrics(self) -> Dict[str, int]:
+        """Return LLM usage metrics for cost tracking."""
+        return {"llm_calls": self.llm_request_count}
+
 
 class DiscordPoster:
     def __init__(self, webhook_url: str):
@@ -461,17 +585,26 @@ class CarDealScanner:
     def __init__(self, supabase_url: str, supabase_key: str, anthropic_key: str, discord_webhook: str, serpapi_key: Optional[str] = None):
         self.store = SupabaseStore(supabase_url, supabase_key)
         self.search = SearchEngine(serpapi_key)
-        self.scraper = ListingScraper()
+        self.scraper = ListingScraper(cache_store=self.store)  # Pass cache store
         self.scorer = DealScorer()
         self.formatter = FormatAgent(anthropic_key)
         self.discord = DiscordPoster(discord_webhook)
+        self.cost_metrics = {
+            "serpapi_calls": 0,
+            "scrape_requests": 0,
+            "llm_calls": 0,
+            "urls_processed": 0,
+            "cache_hits": 0,
+        }
 
     def run(self, dry_run: bool = False) -> None:
         seen_ids = self.store.get_seen_ids()
         urls = self._collect_candidate_urls(seen_ids)
+        self.cost_metrics["urls_processed"] = len(urls)
         new_listings = self._load_listings(urls, seen_ids)
         deals = self._score_listings(new_listings)
         top_deals = sorted(deals, key=lambda d: d.score, reverse=True)[:4]
+        
         if not top_deals:
             payload = {
                 "embeds": [
@@ -483,10 +616,24 @@ class CarDealScanner:
                 ]
             }
             print(json.dumps(payload, indent=2))
+            self._print_cost_report()
             return
-        enriched_deals = [self.formatter.enrich_deal(deal) for deal in top_deals]
+        
+        # Only enrich if multiple deals found (batch efficiency)
+        if len(top_deals) >= MIN_BATCH_SIZE_FOR_ENRICHMENT:
+            enriched_deals = [self.formatter.enrich_deal(deal) for deal in top_deals]
+        else:
+            enriched_deals = top_deals
+        
         formatted = self.formatter.format_payload(enriched_deals)
         print(json.dumps(formatted, indent=2))
+        
+        # Collect cost metrics
+        self.cost_metrics.update(self.search.get_cost_metrics())
+        self.cost_metrics.update(self.scraper.get_cost_metrics())
+        self.cost_metrics.update(self.formatter.get_cost_metrics())
+        self._print_cost_report()
+        
         if not dry_run:
             self.discord.post(formatted["header"])
             self.discord.post(formatted["deals"])
@@ -496,7 +643,7 @@ class CarDealScanner:
         urls = []
         for query in SEARCH_QUERIES:
             urls.extend(self.search.search(query))
-            time.sleep(1)
+            time.sleep(SEARCH_BATCH_DELAY_SECONDS)  # Throttle API calls
         unique_urls = []
         seen = set()
         for url in urls:
@@ -528,6 +675,18 @@ class CarDealScanner:
             if deal:
                 deals.append(deal)
         return deals
+
+    def _print_cost_report(self) -> None:
+        """Print cost optimization report."""
+        print("\n" + "="*60)
+        print("COST OPTIMIZATION REPORT")
+        print("="*60)
+        print(f"URLs Processed: {self.cost_metrics['urls_processed']}")
+        print(f"Search API Calls (SerpAPI): {self.cost_metrics['serpapi_calls']}")
+        print(f"Web Scrape Requests: {self.cost_metrics['scrape_requests']}")
+        print(f"LLM API Calls (Anthropic): {self.cost_metrics['llm_calls']}")
+        print(f"Cache Hits: {self.cost_metrics.get('cache_hits', 0)}")
+        print("="*60 + "\n")
 
 
 def load_config() -> Dict[str, str]:
