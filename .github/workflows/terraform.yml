@@ -1,0 +1,144 @@
+name: Terraform Plan & Apply
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    
+    env:
+      TF_VERSION: 1.5.0
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: Terraform Format Check
+      id: fmt
+      run: |
+        cd terraform
+        terraform fmt -check -recursive
+      continue-on-error: true
+
+    - name: Terraform Init
+      id: init
+      run: |
+        cd terraform
+        terraform init
+
+    - name: Terraform Validate
+      id: validate
+      run: |
+        cd terraform
+        terraform validate
+
+    - name: Terraform Plan
+      id: plan
+      run: |
+        cd terraform
+        terraform plan -no-color -input=false \
+          -var-file=terraform.tfvars \
+          -var="anthropic_api_key=${{ secrets.ANTHROPIC_API_KEY }}" \
+          -var="discord_webhook_url=${{ secrets.DISCORD_WEBHOOK_URL }}" \
+          -var="serpapi_api_key=${{ secrets.SERPAPI_API_KEY }}" \
+          -var="langsmith_api_key=${{ secrets.LANGSMITH_API_KEY }}" \
+          -var="supabase_url=${{ secrets.SUPABASE_URL }}" \
+          -var="supabase_key=${{ secrets.SUPABASE_KEY }}" \
+          -var="rds_password=${{ secrets.RDS_PASSWORD }}" \
+          -out=tfplan
+      continue-on-error: true
+
+    - name: Update Pull Request with Plan
+      uses: actions/github-script@v6
+      if: github.event_name == 'pull_request'
+      env:
+        PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+      with:
+        script: |
+          const fs = require('fs');
+          const plan = process.env.PLAN;
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: '## Terraform Plan\n```\n' + plan + '\n```'
+          })
+
+    - name: Terraform Apply
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      run: |
+        cd terraform
+        terraform apply -no-color -input=false tfplan
+
+    - name: Set Terraform Outputs
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      run: |
+        cd terraform
+        echo "ALB_HOSTNAME=$(terraform output -raw alb_hostname)" >> $GITHUB_ENV
+        echo "ECR_REPOSITORY_URL=$(terraform output -raw ecr_repository_url)" >> $GITHUB_ENV
+
+    - name: Notify Slack - Plan
+      if: github.event_name == 'pull_request'
+      uses: slackapi/slack-github-action@v1.24.0
+      with:
+        payload: |
+          {
+            "text": "Terraform plan generated",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "📋 Terraform plan for PR #${{ github.event.pull_request.number }}\n*Status:* ${{ steps.plan.outcome }}\n*Commit:* ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+                }
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+    - name: Notify Slack - Applied
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: slackapi/slack-github-action@v1.24.0
+      with:
+        payload: |
+          {
+            "text": "Terraform applied successfully",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "✅ Infrastructure updated\n*ALB:* ${{ env.ALB_HOSTNAME }}\n*ECR:* ${{ env.ECR_REPOSITORY_URL }}"
+                }
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

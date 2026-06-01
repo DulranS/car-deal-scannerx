@@ -1,0 +1,135 @@
+name: Deploy to AWS ECS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: Download task definition
+      run: |
+        aws ecs describe-task-definition \
+          --task-definition car-deal-scanner \
+          --query taskDefinition > task-definition.json
+
+    - name: Fill in the new image ID in the Amazon ECS task definition
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: task-definition.json
+        container-name: car-deal-scanner
+        image: ${{ secrets.ECR_REGISTRY }}/car-deal-scanner:${{ github.sha }}
+
+    - name: Deploy to Amazon ECS service
+      uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+      with:
+        task-definition: ${{ steps.task-def.outputs.task-definition }}
+        service: car-deal-scanner-service
+        cluster: car-deal-scanner-cluster
+        wait-for-service-stability: true
+
+    - name: Wait for deployment to stabilize
+      run: |
+        aws ecs wait services-stable \
+          --cluster car-deal-scanner-cluster \
+          --services car-deal-scanner-service
+
+    - name: Health check
+      run: |
+        # Get ALB DNS name
+        ALB_DNS=$(aws elbv2 describe-load-balancers \
+          --names car-deal-scanner-alb \
+          --query 'LoadBalancers[0].DNSName' \
+          --output text)
+        
+        # Wait for service to be healthy
+        for i in {1..30}; do
+          if curl -f "http://$ALB_DNS/health" > /dev/null 2>&1; then
+            echo "✓ Service is healthy"
+            exit 0
+          fi
+          echo "Health check attempt $i/30..."
+          sleep 10
+        done
+        exit 1
+
+    - name: Create deployment annotation
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.repos.createDeployment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: context.ref,
+            environment: '${{ github.event.inputs.environment || 'staging' }}',
+            description: 'Deployed by GitHub Actions',
+            production_environment: '${{ github.event.inputs.environment == 'production' }}'
+          });
+
+    - name: Notify Slack on success
+      if: success()
+      uses: slackapi/slack-github-action@v1.24.0
+      with:
+        payload: |
+          {
+            "text": "✅ Deployment successful",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "✅ Deployed to ${{ github.event.inputs.environment || 'staging' }}\n*Service:* car-deal-scanner\n*Commit:* ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+                }
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+    - name: Notify Slack on failure
+      if: failure()
+      uses: slackapi/slack-github-action@v1.24.0
+      with:
+        payload: |
+          {
+            "text": "❌ Deployment failed",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "❌ Deployment to ${{ github.event.inputs.environment || 'staging' }} failed\n*Service:* car-deal-scanner\n*Run:* ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                }
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

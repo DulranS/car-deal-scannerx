@@ -1,0 +1,119 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: car-deal-scanner
+    ports:
+      - "8000:8000"
+    environment:
+      # Core API keys
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+      - SERPAPI_API_KEY=${SERPAPI_API_KEY}
+      
+      # Database
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      
+      # Redis Cache
+      - REDIS_URL=redis://redis:6379
+      
+      # LangSmith Observability
+      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
+      - LANGSMITH_PROJECT=car-deal-scanner
+      - LANGSMITH_TRACING=true
+      
+      # App configuration
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=production
+    
+    depends_on:
+      - redis
+      - postgres
+    
+    volumes:
+      - ./logs:/app/logs
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    container_name: car-scanner-redis
+    ports:
+      - "6379:6379"
+    
+    volumes:
+      - redis-data:/data
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: car-scanner-db
+    
+    environment:
+      - POSTGRES_USER=${DB_USER:-postgres}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-changeme}
+      - POSTGRES_DB=${DB_NAME:-car_scanner}
+    
+    ports:
+      - "5432:5432"
+    
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Optional: Development tools
+  adminer:
+    image: adminer
+    container_name: car-scanner-adminer
+    ports:
+      - "8080:8080"
+    
+    depends_on:
+      - postgres
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+    driver: local
+  postgres-data:
+    driver: local
+
+networks:
+  app-network:
+    driver: bridge

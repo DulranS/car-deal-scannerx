@@ -1,0 +1,32 @@
+# Development environment example
+environment = "development"
+aws_region  = "us-east-1"
+
+container_image = "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/car-deal-scanner:latest"
+container_cpu   = "256"
+container_memory = "512"
+
+desired_count  = 1
+min_capacity   = 1
+max_capacity   = 2
+
+rds_instance_class     = "db.t3.micro"
+rds_allocated_storage  = 20
+rds_username           = "postgres"
+# rds_password         = "changeme"  # Set via environment variable
+
+elasticache_node_type     = "cache.t3.micro"
+elasticache_num_cache_nodes = 1
+
+# API Keys (set via environment variables or terraform.tfvars)
+# anthropic_api_key  = ""
+# discord_webhook_url = ""
+# serpapi_api_key    = ""
+# langsmith_api_key  = ""
+# supabase_url       = ""
+# supabase_key       = ""
+
+tags = {
+  Environment = "development"
+  ManagedBy   = "Terraform"
+}
