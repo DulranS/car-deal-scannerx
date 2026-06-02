@@ -16,7 +16,7 @@ import os
 import json
 import hashlib
 from typing import Dict, List, Optional, Any, TypedDict
-from dataclasses import dataclass, asdict
+
 from datetime import datetime
 from enum import Enum
 
@@ -72,15 +72,7 @@ class AgentState(TypedDict):
     agent_logs: List[str]
 
 
-@dataclass
-class CacheConfig:
-    """Prompt caching configuration"""
-    ttl_hours: int = 24
-    market_data_cache: Dict[str, tuple] = None
-    
-    def __post_init__(self):
-        if self.market_data_cache is None:
-            self.market_data_cache = {}
+# CacheConfig removed — PromptCache manages its own cache and TTL.
 
 
 class ModelRouter:
@@ -108,13 +100,8 @@ class ModelRouter:
                 temperature=0,
                 max_tokens=4096,
             )
-    
-    def select_model(self, task_type: str) -> ChatAnthropic:
-        """
-        Select model based on task complexity
-        Simple: Haiku (fast, cheap)
-        Complex: Opus (powerful reasoning)
-        """
+    def select_model(self, task_type: str):
+        """Select model based on task complexity."""
         simple_tasks = ["scrape", "parse", "extract", "format"]
         return self.haiku if task_type in simple_tasks else self.opus
 
@@ -124,7 +111,7 @@ class PromptCache:
     
     def __init__(self):
         self.cache: Dict[str, tuple] = {}  # (data, timestamp)
-        self.cache_config = CacheConfig()
+        self.ttl_seconds = 24 * 60 * 60
     
     def get_cache_key(self, model_id: str, market_data: Dict) -> str:
         """Generate cache key from model and market data"""
