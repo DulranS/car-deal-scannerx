@@ -345,7 +345,7 @@ START_HERE.md (You are here)
   - [ ] AWS_REGION
   - [ ] ANTHROPIC_API_KEY
   - [ ] LANGSMITH_API_KEY
-  - [ ] SLACK_WEBHOOK_URL
+  - [ ] DISCORD_WEBHOOK_URL
 - [ ] Review terraform.tfvars
 - [ ] Initialize Terraform backend
 
@@ -356,6 +356,8 @@ START_HERE.md (You are here)
 - [ ] Configure WAF rules
 - [ ] Enable request logging
 - [ ] Set up custom domain & HTTPS
+- [ ] Monitor context window overflow patterns
+- [ ] Review RAG invocation frequency
 
 ### Ongoing
 - [ ] Monitor LangSmith daily

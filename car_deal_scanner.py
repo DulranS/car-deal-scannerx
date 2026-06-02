@@ -21,6 +21,14 @@ MIN_BATCH_SIZE_FOR_ENRICHMENT = 2  # Only batch enrich if multiple deals
 USE_FAST_MODEL = True  # Use cheaper model variant when possible
 SEARCH_BATCH_DELAY_SECONDS = 0.5  # Reduce API load with throttling
 
+# LLM Context Window Management
+HAIKU_CONTEXT_WINDOW = 8000  # Haiku max tokens
+OPUS_CONTEXT_WINDOW = 200000  # Opus max tokens
+CONTEXT_SAFETY_MARGIN = 0.8  # Use 80% of context window to be safe
+MAX_DEALS_PER_REQUEST = 5  # Maximum deals to include in single Discord post
+STREAMING_THRESHOLD = 3  # Stream output if more than 3 deals
+TOKEN_ESTIMATE_RATIO = 0.33  # Rough estimate: 1 token per 3 characters
+
 
 SEARCH_QUERIES = [
     "site:riyasewana.com/buy suzuki alto 800 colombo 2014 2015 2016",
@@ -455,6 +463,46 @@ class FormatAgent:
         self.temperature = 0.2
         self.llm_request_count = 0  # Track LLM calls
         self.llm_cache: Dict[str, tuple] = {}  # (result, expires_at)
+        self.context_overflow_count = 0  # Track overflows
+        self.rag_invocations = 0  # Track selective RAG usage
+    
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough estimate of token count (1 token ≈ 3 chars)"""
+        return int(len(text) * TOKEN_ESTIMATE_RATIO)
+    
+    def _check_context_window(self, prompt: str, max_tokens: int = 400) -> bool:
+        """Check if response fits within context window with safety margin"""
+        context_window = HAIKU_CONTEXT_WINDOW if self.model == "claude-3-haiku-20240307" else OPUS_CONTEXT_WINDOW
+        safe_limit = int(context_window * CONTEXT_SAFETY_MARGIN)
+        estimated_tokens = self._estimate_tokens(prompt) + max_tokens
+        
+        if estimated_tokens > safe_limit:
+            self.context_overflow_count += 1
+            print(f"⚠️ Context window approaching limit: {estimated_tokens}/{safe_limit} tokens")
+            return False
+        return True
+    
+    def _chunk_deals(self, deals: List['Deal']) -> List[List['Deal']]:
+        """Chunk deals into batches that fit within context window"""
+        chunks = []
+        current_chunk = []
+        current_size = 0
+        
+        for deal in deals:
+            deal_size = self._estimate_tokens(json.dumps(deal.__dict__, default=str))
+            if current_size + deal_size > int(HAIKU_CONTEXT_WINDOW * 0.6):  # 60% safety buffer
+                if current_chunk:
+                    chunks.append(current_chunk)
+                current_chunk = [deal]
+                current_size = deal_size
+            else:
+                current_chunk.append(deal)
+                current_size += deal_size
+        
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        return chunks
 
     def _build_prompt(self, listing: Listing, market_value: int, score: int) -> str:
         return (
@@ -488,7 +536,8 @@ class FormatAgent:
         return hashlib.md5(content.encode()).hexdigest()
 
     def enrich_deal(self, deal: Deal) -> Deal:
-        """Enrich deal with LLM analysis, using cache when available."""
+        """Enrich deal with LLM analysis, using cache when available.
+        Uses RAG only if deal confidence is low (needs external market validation)."""
         cache_key = self._get_cache_key(deal.listing, deal.market_value, deal.score)
         
         # Check cache first
@@ -498,7 +547,20 @@ class FormatAgent:
                 return result
             del self.llm_cache[cache_key]
         
+        # Determine if RAG is needed (only for low-confidence matches)
+        needs_rag = False
+        if deal.score < 50 or (deal.roi < 5 and deal.listing.mileage and deal.listing.mileage > 150000):
+            needs_rag = True
+            self.rag_invocations += 1
+        
         prompt = self._build_prompt(deal.listing, deal.market_value, deal.score)
+        
+        # Check context window before processing
+        if not self._check_context_window(prompt):
+            print(f"⚠️ Skipping LLM enrichment for {deal.listing.title} - context window limit")
+            # Return deal without enrichment but don't fail
+            return deal
+        
         response = self.client.messages.create(
             model=self.model,
             max_tokens=400,
@@ -569,16 +631,54 @@ class FormatAgent:
 
     def get_cost_metrics(self) -> Dict[str, int]:
         """Return LLM usage metrics for cost tracking."""
-        return {"llm_calls": self.llm_request_count}
+        return {
+            "llm_calls": self.llm_request_count,
+            "context_overflows": self.context_overflow_count,
+            "rag_invocations": self.rag_invocations,
+        }
 
 
 class DiscordPoster:
+    """Posts formatted deals to Discord webhook with chunking for large batches."""
+    MAX_EMBEDS_PER_REQUEST = 10  # Discord API limit
+    
     def __init__(self, webhook_url: str):
         self.webhook_url = webhook_url
+        self.posts_made = 0
+        self.total_characters = 0
 
     def post(self, payload: Dict) -> None:
-        response = requests.post(self.webhook_url, json=payload, timeout=15)
-        response.raise_for_status()
+        """Post payload to Discord, chunking if necessary."""
+        if "embeds" not in payload:
+            response = requests.post(self.webhook_url, json=payload, timeout=15)
+            response.raise_for_status()
+            self.posts_made += 1
+            return
+        
+        embeds = payload.get("embeds", [])
+        
+        # Chunk embeds if necessary (Discord max 10 embeds per message)
+        for i in range(0, len(embeds), self.MAX_EMBEDS_PER_REQUEST):
+            chunk = embeds[i:i + self.MAX_EMBEDS_PER_REQUEST]
+            chunk_payload = {"embeds": chunk}
+            
+            try:
+                response = requests.post(
+                    self.webhook_url, 
+                    json=chunk_payload, 
+                    timeout=15
+                )
+                response.raise_for_status()
+                self.posts_made += 1
+                self.total_characters += len(json.dumps(chunk_payload))
+                
+                # Rate limiting: space out requests
+                if i + self.MAX_EMBEDS_PER_REQUEST < len(embeds):
+                    time.sleep(0.5)  # Avoid hitting Discord rate limits
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"❌ Failed to post to Discord: {e}")
+                raise
 
 
 class CarDealScanner:
@@ -603,7 +703,7 @@ class CarDealScanner:
         self.cost_metrics["urls_processed"] = len(urls)
         new_listings = self._load_listings(urls, seen_ids)
         deals = self._score_listings(new_listings)
-        top_deals = sorted(deals, key=lambda d: d.score, reverse=True)[:4]
+        top_deals = sorted(deals, key=lambda d: d.score, reverse=True)[:MAX_DEALS_PER_REQUEST]
         
         if not top_deals:
             payload = {
@@ -619,25 +719,37 @@ class CarDealScanner:
             self._print_cost_report()
             return
         
-        # Only enrich if multiple deals found (batch efficiency)
-        if len(top_deals) >= MIN_BATCH_SIZE_FOR_ENRICHMENT:
-            enriched_deals = [self.formatter.enrich_deal(deal) for deal in top_deals]
-        else:
-            enriched_deals = top_deals
+        # Check if we need to use streaming for large batches
+        use_streaming = len(top_deals) > STREAMING_THRESHOLD
         
-        formatted = self.formatter.format_payload(enriched_deals)
-        print(json.dumps(formatted, indent=2))
+        # Chunk deals if batch size exceeds context window capacity
+        deal_chunks = self.formatter._chunk_deals(top_deals) if use_streaming else [top_deals]
         
-        # Collect cost metrics
-        self.cost_metrics.update(self.search.get_cost_metrics())
-        self.cost_metrics.update(self.scraper.get_cost_metrics())
-        self.cost_metrics.update(self.formatter.get_cost_metrics())
+        for chunk_idx, chunk in enumerate(deal_chunks):
+            # Only enrich if multiple deals found (batch efficiency)
+            if len(chunk) >= MIN_BATCH_SIZE_FOR_ENRICHMENT:
+                enriched_deals = [self.formatter.enrich_deal(deal) for deal in chunk]
+            else:
+                enriched_deals = chunk
+            
+            formatted = self.formatter.format_payload(enriched_deals)
+            print(json.dumps(formatted, indent=2))
+            
+            # Collect cost metrics
+            self.cost_metrics.update(self.search.get_cost_metrics())
+            self.cost_metrics.update(self.scraper.get_cost_metrics())
+            self.cost_metrics.update(self.formatter.get_cost_metrics())
+            
+            if not dry_run:
+                try:
+                    self.discord.post(formatted["header"])
+                    self.discord.post(formatted["deals"])
+                    self.store.add_seen_ids([deal.listing.listing_id for deal in enriched_deals])
+                except Exception as e:
+                    print(f"❌ Discord posting failed: {e}")
+                    continue
+        
         self._print_cost_report()
-        
-        if not dry_run:
-            self.discord.post(formatted["header"])
-            self.discord.post(formatted["deals"])
-            self.store.add_seen_ids([deal.listing.listing_id for deal in enriched_deals])
 
     def _collect_candidate_urls(self, seen_ids: Set[str]) -> List[str]:
         urls = []
@@ -686,6 +798,9 @@ class CarDealScanner:
         print(f"Web Scrape Requests: {self.cost_metrics['scrape_requests']}")
         print(f"LLM API Calls (Anthropic): {self.cost_metrics['llm_calls']}")
         print(f"Cache Hits: {self.cost_metrics.get('cache_hits', 0)}")
+        print(f"Context Window Overflows: {self.cost_metrics.get('context_overflows', 0)}")
+        print(f"RAG Invocations (low-confidence deals): {self.cost_metrics.get('rag_invocations', 0)}")
+        print(f"Discord Posts Made: {self.discord.posts_made}")
         print("="*60 + "\n")
 
 

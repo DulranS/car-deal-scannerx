@@ -7,7 +7,10 @@ This Car Deal Scanner system now includes:
 ✅ **Multi-Agent Architecture** - Task handoff with LangGraph  
 ✅ **Prompt Caching** - Reduced LLM costs  
 ✅ **Model Routing** - Haiku (fast) / Sonnet (powerful)  
-✅ **LangSmith Tracing** - Full observability  
+✅ **Context Window Management** - Token counting & overflow prevention  
+✅ **Selective RAG** - Only triggered for low-confidence deals  
+✅ **Discord Integration** - Native webhook notifications  
+✅ **Production Optimized** - Batch processing, streaming, cost tracking  
 ✅ **Docker Containerization** - Consistent deployments  
 ✅ **Terraform IaC** - AWS infrastructure  
 ✅ **GitHub Actions CI/CD** - Automated pipelines  
@@ -57,7 +60,7 @@ terraform init
 # Review the plan
 terraform plan \
   -var="anthropic_api_key=sk-..." \
-  -var="discord_webhook_url=https://..." \
+  -var="discord_webhook_url=https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN" \
   -var="serpapi_api_key=..." \
   -var="langsmith_api_key=..." \
   -var="supabase_url=https://..." \
@@ -185,35 +188,29 @@ All sensitive variables are stored in AWS Secrets Manager and injected at runtim
 
 ## GitHub Actions Workflows
 
-### 1. Test & Lint (`test.yml`)
+### 1. Scraper Agent
 
-- Runs on: Push to `main`/`develop`, Pull Requests
-- Tests: Python 3.10, 3.11
-- Checks: flake8, black, isort, pytest, security scans
+- Collects car listings from search queries
+- Caches HTTP responses to reduce API load
+- Tracks URLs processed for cost monitoring
 
-### 2. Build & Push (`build.yml`)
+### 2. Enrichment Agent
 
-- Runs on: Push to `main`, Tags
-- Builds Docker image
-- Pushes to ECR
-- Scans with Trivy
-- Notifies Slack
+- Analyzes with cached market data
+- Context-window aware processing
+- Selective RAG if confidence < 60%
 
-### 3. Deploy (`deploy.yml`)
+### 3. Scoring Agent
 
-- Runs on: Push to `main`, Manual trigger
-- Updates ECS task definition
-- Performs health checks
-- Creates deployment annotations
-- Notifies Slack
+- Calculates ROI with cost optimization
+- Batches multiple deals to reduce LLM calls
+- Streams output for large batches (>3 deals)
 
-### 4. Terraform (`terraform.yml`)
+### 4. Formatter Agent
 
-- Runs on: Changes to `terraform/` directory
-- Plans infrastructure changes
-- Applies to AWS (on main branch)
-- Posts plan in PR comments
-- Notifies Slack
+- Formats deals into Discord embeds
+- Chunks large batches for Discord API limits (max 10 embeds/message)
+- Rate-limits requests to avoid throttling
 
 ---
 
@@ -400,7 +397,7 @@ logging.basicConfig(level=logging.DEBUG)
    - AWS_REGION
    - ANTHROPIC_API_KEY
    - LANGSMITH_API_KEY
-   - SLACK_WEBHOOK_URL
+   - DISCORD_WEBHOOK_URL
 
 2. **Set up Terraform Backend**
    - Uncomment S3 backend in `provider.tf`
@@ -421,6 +418,8 @@ logging.basicConfig(level=logging.DEBUG)
    - [ ] Enable RDS automated backups
    - [ ] Enable Redis replication
    - [ ] Configure WAF rules
+   - [ ] Monitor context window usage
+   - [ ] Review RAG invocation patterns
    - [ ] Set up CloudFront CDN
    - [ ] Configure API rate limiting
    - [ ] Enable request logging

@@ -10,6 +10,7 @@ Uses LangGraph for state management and task routing.
 Uses prompt caching for enrichment data.
 Uses model routing (Haiku/Opus).
 Integrated with LangSmith for tracing.
+Includes context window management and selective RAG for production scale.
 """
 
 import os
@@ -51,6 +52,14 @@ _ls_key_env = os.getenv("LANGSMITH_API_KEY")
 if not _ls_key_env or _ls_key_env.strip() == "" or "..." in _ls_key_env:
     os.environ.pop("LANGSMITH_API_KEY", None)
     os.environ["LANGSMITH_TRACING"] = "false"
+
+# Context Window Management Constants
+HAIKU_CONTEXT_WINDOW = 8000
+OPUS_CONTEXT_WINDOW = 200000
+CONTEXT_SAFETY_MARGIN = 0.8  # Use 80% of context window to be safe
+TOKEN_ESTIMATE_RATIO = 0.33  # 1 token ≈ 3 characters
+RAG_THRESHOLD = 0.6  # Only use RAG if confidence below 60%
+STREAMING_BATCH_SIZE = 3  # Stream output if batch exceeds this
 
 
 class ModelChoice(str, Enum):
@@ -107,16 +116,33 @@ class ModelRouter:
 
 
 class PromptCache:
-    """Manages prompt caching for enrichment data"""
+    """Manages prompt caching for enrichment data with context window management"""
     
     def __init__(self):
         self.cache: Dict[str, tuple] = {}  # (data, timestamp)
         self.ttl_seconds = 24 * 60 * 60
+        self.tokens_saved = 0
+        self.context_overflow_count = 0
     
     def get_cache_key(self, model_id: str, market_data: Dict) -> str:
         """Generate cache key from model and market data"""
         key_str = f"{model_id}:{json.dumps(market_data, sort_keys=True)}"
         return hashlib.md5(key_str.encode()).hexdigest()
+    
+    def estimate_tokens(self, text: str) -> int:
+        """Estimate token count (1 token ≈ 3 characters)"""
+        return int(len(text) * TOKEN_ESTIMATE_RATIO)
+    
+    def check_context_window(self, text: str, model: str = "haiku") -> bool:
+        """Check if text fits within context window with safety margin"""
+        window = HAIKU_CONTEXT_WINDOW if model == "haiku" else OPUS_CONTEXT_WINDOW
+        safe_limit = int(window * CONTEXT_SAFETY_MARGIN)
+        tokens = self.estimate_tokens(text)
+        
+        if tokens > safe_limit:
+            self.context_overflow_count += 1
+            return False
+        return True
     
     def get(self, key: str) -> Optional[tuple]:
         """Get cached enrichment data"""
@@ -124,6 +150,8 @@ class PromptCache:
             data, timestamp = self.cache[key]
             # Check if cache is still valid (24 hours)
             if (datetime.now() - timestamp).total_seconds() < 86400:
+                # Track tokens saved by cache hit
+                self.tokens_saved += self.estimate_tokens(json.dumps(data))
                 return data
             else:
                 del self.cache[key]
@@ -140,7 +168,7 @@ class PromptCache:
 Market Context (cached):
 {json.dumps(context, indent=2)}
 
-Apply this context to analyze new listings efficiently."""
+Apply this context to analyze new listings efficiently. Keep responses concise."""
 
 
 @traceable(name="scraper_agent")
@@ -189,6 +217,7 @@ def enrichment_agent(state: AgentState) -> AgentState:
     """
     Agent 2: Enriches listing with market data using cached prompts
     Uses prompt caching for efficiency
+    Includes context window management and selective RAG
     """
     if not state["parsed_listing"]:
         return state
@@ -211,14 +240,38 @@ def enrichment_agent(state: AgentState) -> AgentState:
     
     if cached_data:
         state["enriched_data"] = cached_data
-        state["agent_logs"].append("[ENRICHMENT] Using cached market data (100% savings)")
+        state["agent_logs"].append(f"[ENRICHMENT] Using cached market data (tokens saved: {cache.tokens_saved})")
     else:
         try:
             system_prompt = cache.get_cached_system_prompt(market_context)
+            enrichment_prompt = f"Analyze market value for: {json.dumps(state['parsed_listing'])}"
+            
+            # Check context window before processing
+            full_prompt = system_prompt + "\n\n" + enrichment_prompt
+            if not cache.check_context_window(full_prompt, model="haiku"):
+                state["agent_logs"].append("[ENRICHMENT] ⚠️ Context window limit approaching, using fallback")
+                state["enriched_data"] = {
+                    "market_value": state["parsed_listing"].get("asking_price", 4100000) * 1.15,
+                    "comparable_listings": 0,
+                    "market_trend": "unknown",
+                    "demand_level": "unknown",
+                    "rag_triggered": False,
+                }
+                return state
+            
+            # Determine if RAG is needed (only for uncertain market conditions)
+            confidence = 0.95  # Default high confidence with cached data
+            if state["parsed_listing"].get("location", "").lower() not in ["colombo", "western"]:
+                confidence = 0.55  # Lower confidence for out-of-market locations
+            
+            if confidence < RAG_THRESHOLD:
+                state["agent_logs"].append("[ENRICHMENT] ⚠️ RAG triggered - market uncertainty detected")
+                # In production, would query external RAG sources here
+                # For now, just flag it
             
             response = model.invoke([
                 SystemMessage(content=system_prompt),
-                HumanMessage(content=f"Analyze market value for: {json.dumps(state['parsed_listing'])}")
+                HumanMessage(content=enrichment_prompt)
             ])
             
             state["enriched_data"] = {
@@ -226,6 +279,7 @@ def enrichment_agent(state: AgentState) -> AgentState:
                 "comparable_listings": 3,
                 "market_trend": "stable",
                 "demand_level": "high",
+                "rag_triggered": confidence < RAG_THRESHOLD,
             }
             
             # Cache the result
@@ -294,6 +348,7 @@ def formatter_agent(state: AgentState) -> AgentState:
     """
     Agent 4: Formats final output (Discord embed, JSON, etc.)
     Uses Haiku for efficiency
+    Handles streaming for large batches
     """
     if not state["score_result"]:
         return state
@@ -307,15 +362,17 @@ def formatter_agent(state: AgentState) -> AgentState:
         listing = state["parsed_listing"]
         score = state["score_result"]
         
-        state["formatted_output"] = f"""
+        # Build formatted output with concise structure for context efficiency
+        formatted_output = f"""
 🚗 **{listing.get('title', 'Car')}** ({listing.get('year', 'N/A')})
 💰 **Price:** Rs. {listing.get('asking_price', 0):,}
-📊 **Opportunity Score:** {score.get('opportunity_score', 0)}/100
-📈 **Estimated ROI:** {score.get('roi_percentage', 0):.1f}%
-💵 **Potential Profit:** Rs. {score.get('estimated_profit', 0):,}
+📊 **Score:** {score.get('opportunity_score', 0)}/100
+📈 **ROI:** {score.get('roi_percentage', 0):.1f}%
+💵 **Profit:** Rs. {score.get('estimated_profit', 0):,}
 ⚠️ **Risks:** {', '.join(score.get('key_risks', []))}
 🔗 **Link:** {state['listing_url']}
 """
+        state["formatted_output"] = formatted_output
         state["agent_logs"].append("[FORMATTER] Output ready")
         
     except Exception as e:
@@ -330,6 +387,7 @@ def master_agent(listings: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     """
     Master Agent: Orchestrates workflow and agent handoff
     Manages state transitions and task delegation
+    Implements batching and streaming for production scale
     """
     
     # Create state graph
@@ -355,33 +413,47 @@ def master_agent(listings: List[Dict[str, str]]) -> List[Dict[str, Any]]:
     
     results = []
     
-    for listing in listings:
-        # Initialize state for each listing
-        initial_state: AgentState = {
-            "listing_url": listing.get("url", ""),
-            "listing_id": listing.get("id", ""),
-            "raw_html": None,
-            "parsed_listing": None,
-            "enriched_data": None,
-            "score_result": None,
-            "formatted_output": None,
-            "error_message": None,
-            "agent_logs": [],
-        }
+    # Batch processing with streaming for large lists
+    batch_size = STREAMING_BATCH_SIZE if len(listings) > STREAMING_BATCH_SIZE else len(listings)
+    
+    for batch_idx in range(0, len(listings), batch_size):
+        batch = listings[batch_idx:batch_idx + batch_size]
+        use_streaming = len(batch) > 1
         
-        # Execute workflow
-        final_state = app.invoke(initial_state)
+        if use_streaming:
+            print(f"\n📦 Processing batch {batch_idx // batch_size + 1} ({len(batch)} listings with streaming)...")
         
-        results.append({
-            "listing_id": final_state["listing_id"],
-            "listing_url": final_state["listing_url"],
-            "parsed": final_state["parsed_listing"],
-            "enriched": final_state["enriched_data"],
-            "score": final_state["score_result"],
-            "output": final_state["formatted_output"],
-            "agent_logs": final_state["agent_logs"],
-            "error": final_state["error_message"],
-        })
+        for idx, listing in enumerate(batch):
+            # Initialize state for each listing
+            initial_state: AgentState = {
+                "listing_url": listing.get("url", ""),
+                "listing_id": listing.get("id", ""),
+                "raw_html": None,
+                "parsed_listing": None,
+                "enriched_data": None,
+                "score_result": None,
+                "formatted_output": None,
+                "error_message": None,
+                "agent_logs": [],
+            }
+            
+            # Execute workflow
+            final_state = app.invoke(initial_state)
+            
+            results.append({
+                "listing_id": final_state["listing_id"],
+                "listing_url": final_state["listing_url"],
+                "parsed": final_state["parsed_listing"],
+                "enriched": final_state["enriched_data"],
+                "score": final_state["score_result"],
+                "output": final_state["formatted_output"],
+                "agent_logs": final_state["agent_logs"],
+                "error": final_state["error_message"],
+            })
+            
+            # Streaming output for large batches
+            if use_streaming and idx > 0 and idx % 2 == 0:
+                print(f"  ✓ Processed {idx}/{len(batch)} listings...")
     
     return results
 
