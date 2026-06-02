@@ -29,6 +29,102 @@ GitHub Actions (CI/CD)
 
 ---
 
+## 🧩 System Design & Business Process Mapping
+
+```text
+                                      +-------------------------+
+                                      |   Business Objective    |
+                                      |-------------------------|
+                                      |  Find and score high-   |
+                                      |  potential car deals    |
+                                      +-----------+-------------+
+                                                  |
+                                                  v
+  +-----------------------+       +--------------------------+       +-------------------------+
+  | External Market       |       | Search + Scrape Layer    |       | Normalized Listing      |
+  | Sources               |       |--------------------------|       | Data                    |
+  |-----------------------|       | - SERPAPI / search       |       |-------------------------|
+  | - Auto listing sites  |------>| - Listing fetch / HTML   |------>| - Structured JSON       |
+  | - Competitive pricing |       | - Scraper Agent          |       | - Title, year, make,    |
+  | - Public APIs         |       |                          |       |   model, price, mileage |
+  +-----------------------+       +--------------------------+       +-------------------------+
+                                                  |
+                                                  v
+                                      +--------------------------+
+                                      | Enrichment Layer         |
+                                      |--------------------------|
+                                      | - Market context prompt   |
+                                      | - Prompt cache (24h TTL)  |
+                                      | - LangGraph state routing |
+                                      | - Model routing: Haiku /  |
+                                      |   Sonnet / Opus           |
+                                      +-----------+--------------+
+                                                  |
+                                                  v
+                                      +--------------------------+
+                                      | Opportunity Scoring      |
+                                      |--------------------------|
+                                      | - Scoring Agent          |
+                                      | - ROI / profit / score   |
+                                      | - Risk factors           |
+                                      +-----------+--------------+
+                                                  |
+                                                  v
+                                      +--------------------------+
+                                      | Output Formatting        |
+                                      |--------------------------|
+                                      | - Formatter Agent        |
+                                      | - Discord / webhook      |
+                                      | - JSON / report-ready    |
+                                      +-----------+--------------+
+                                                  |
+                                                  v
+                                      +--------------------------+
+                                      | Persistence & Dedup      |
+                                      |--------------------------|
+                                      | - Redis / ElastiCache    |
+                                      | - Supabase / RDS         |
+                                      | - Seen IDs / content hash|
+                                      +-----------+--------------+
+                                                  |
+                                                  v
+                                      +--------------------------+
+                                      | Production Infrastructure |
+                                      |--------------------------|
+                                      | - Docker container       |
+                                      | - ECS Fargate            |
+                                      | - ALB / load balancing   |
+                                      | - Terraform provisioning |
+                                      | - GitHub Actions CI/CD   |
+                                      +--------------------------+
+```
+
+### Business process mapping
+
+```text
+Business Process                          Technical Component
+────────────────────────────────────────────────────────────────────────────────
+Discover Listings                          Search + Scrape Layer, Scraper Agent
+Normalize Listing Data                     Scraper Agent output -> structured JSON
+Enrich with Market Context                 Enrichment Agent, Prompt Cache, model routing
+Score Opportunity                          Scoring Agent, ROI/risk model
+Format & Notify                            Formatter Agent, Discord webhook / output channel
+Persist and Deduplicate                    Redis / ElastiCache, Supabase / RDS
+Monitor & Trace                            LangSmith tracing, observability.py
+Deploy to Production                       Docker, ECS, ALB, Terraform, GitHub Actions
+```
+
+### How this maps to business value
+- `Discover Listings`: keeps the deal pipeline full by capturing live market supply.
+- `Normalize Listing Data`: turns raw listings into consistent, analyzable records.
+- `Enrich with Market Context`: layers in pricing intelligence for more accurate opportunities.
+- `Score Opportunity`: converts listings into actionable investment decisions.
+- `Format & Notify`: makes insights consumable for operations, sales, and trading.
+- `Persist and Deduplicate`: avoids duplicates and preserves decision history.
+- `Monitor & Trace`: supports reliability and governance for a production trading pipeline.
+
+---
+
 ## 📦 Files Overview
 
 ### Core Application
