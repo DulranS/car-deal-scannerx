@@ -16,6 +16,7 @@ Includes context window management and selective RAG for production scale.
 import os
 import json
 import hashlib
+import requests
 from typing import Dict, List, Optional, Any, TypedDict
 
 from datetime import datetime
@@ -88,27 +89,23 @@ class ModelRouter:
     """Routes to appropriate Claude model based on task complexity"""
     
     def __init__(self):
-        # If Anthropic API key is not configured or appears to be a placeholder,
-        # provide a local dummy model to allow offline/testing runs without raising authentication errors.
-        _anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-        class _DummyModel:
-            def invoke(self, messages):
-                return {"mock": True}
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        if not anthropic_key or anthropic_key.strip() == "" or "..." in anthropic_key:
+            raise EnvironmentError(
+                "ANTHROPIC_API_KEY is required for production execution."
+            )
 
-        if not _anthropic_key or _anthropic_key.strip() == "" or "..." in _anthropic_key:
-            self.haiku = _DummyModel()
-            self.opus = _DummyModel()
-        else:
-            self.haiku = ChatAnthropic(
-                model=ModelChoice.HAIKU.value,
-                temperature=0,
-                max_tokens=1024,
-            )
-            self.opus = ChatAnthropic(
-                model=ModelChoice.OPUS.value,
-                temperature=0,
-                max_tokens=4096,
-            )
+        self.haiku = ChatAnthropic(
+            model=ModelChoice.HAIKU.value,
+            temperature=0,
+            max_tokens=1024,
+        )
+        self.opus = ChatAnthropic(
+            model=ModelChoice.OPUS.value,
+            temperature=0,
+            max_tokens=4096,
+        )
+
     def select_model(self, task_type: str):
         """Select model based on task complexity."""
         simple_tasks = ["scrape", "parse", "extract", "format"]
@@ -171,6 +168,41 @@ Market Context (cached):
 Apply this context to analyze new listings efficiently. Keep responses concise."""
 
 
+def _extract_json_content(response: Any) -> Optional[Dict[str, Any]]:
+    """Parse structured JSON from model return values."""
+    if isinstance(response, dict):
+        return response
+
+    raw = None
+    if hasattr(response, "content"):
+        raw = response.content
+    elif isinstance(response, str):
+        raw = response
+    elif isinstance(response, bytes):
+        raw = response.decode("utf-8", errors="ignore")
+    else:
+        raw = str(response)
+
+    if not raw:
+        return None
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(raw[start:end])
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
 @traceable(name="scraper_agent")
 def scraper_agent(state: AgentState) -> AgentState:
     """
@@ -187,21 +219,28 @@ def scraper_agent(state: AgentState) -> AgentState:
     Return valid JSON only."""
     
     try:
-        # Simulate scraping (in production, use actual scraping)
+        response = requests.get(state["listing_url"], timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        html = response.text
+
         response = model.invoke([
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Extract car data from this URL: {state['listing_url']}")
+            HumanMessage(content=f"Extract car data from the HTML page below and return valid JSON only:\n\n{html}")
         ])
-        
+
+        parsed_data = _extract_json_content(response)
+        if not parsed_data:
+            raise ValueError("Failed to parse scraper model response as JSON.")
+
         state["parsed_listing"] = {
-            "title": "Sample Car",
-            "year": 2015,
-            "make": "Suzuki",
-            "model": "Alto",
-            "asking_price": 3500000,
-            "mileage": 125000,
-            "transmission": "Manual",
-            "location": "Colombo",
+            "title": parsed_data.get("title"),
+            "year": int(parsed_data["year"]) if parsed_data.get("year") else None,
+            "make": parsed_data.get("make"),
+            "model": parsed_data.get("model"),
+            "asking_price": int(parsed_data["asking_price"]) if parsed_data.get("asking_price") else None,
+            "mileage": int(parsed_data["mileage"]) if parsed_data.get("mileage") else None,
+            "transmission": parsed_data.get("transmission"),
+            "location": parsed_data.get("location"),
         }
         state["agent_logs"].append("[SCRAPER] Parsing complete")
         
@@ -249,15 +288,8 @@ def enrichment_agent(state: AgentState) -> AgentState:
             # Check context window before processing
             full_prompt = system_prompt + "\n\n" + enrichment_prompt
             if not cache.check_context_window(full_prompt, model="haiku"):
-                state["agent_logs"].append("[ENRICHMENT] ⚠️ Context window limit approaching, using fallback")
-                state["enriched_data"] = {
-                    "market_value": state["parsed_listing"].get("asking_price", 4100000) * 1.15,
-                    "comparable_listings": 0,
-                    "market_trend": "unknown",
-                    "demand_level": "unknown",
-                    "rag_triggered": False,
-                }
-                return state
+                state["agent_logs"].append("[ENRICHMENT] ⚠️ Context window limit approaching, using compact prompt")
+                enrichment_prompt = f"Analyze the market value and comparable listings for this listing: {json.dumps(state['parsed_listing'])}"
             
             # Determine if RAG is needed (only for uncertain market conditions)
             confidence = 0.95  # Default high confidence with cached data
@@ -273,14 +305,13 @@ def enrichment_agent(state: AgentState) -> AgentState:
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=enrichment_prompt)
             ])
-            
-            state["enriched_data"] = {
-                "market_value": 4100000,
-                "comparable_listings": 3,
-                "market_trend": "stable",
-                "demand_level": "high",
-                "rag_triggered": confidence < RAG_THRESHOLD,
-            }
+
+            enriched_data = _extract_json_content(response)
+            if not enriched_data:
+                raise ValueError("Failed to parse enrichment model response as JSON.")
+
+            enriched_data.setdefault("rag_triggered", confidence < RAG_THRESHOLD)
+            state["enriched_data"] = enriched_data
             
             # Cache the result
             cache.set(cache_key, state["enriched_data"])
@@ -318,9 +349,11 @@ def scoring_agent(state: AgentState) -> AgentState:
         listing = state["parsed_listing"]
         enriched = state["enriched_data"]
         
-        # Calculate metrics
-        market_value = enriched.get("market_value", 4100000)
-        asking_price = listing.get("asking_price", 3500000)
+        market_value = enriched.get("market_value")
+        asking_price = listing.get("asking_price")
+        if market_value is None or asking_price is None:
+            raise ValueError("Missing pricing data for scoring calculation.")
+
         roi = ((market_value - asking_price) / asking_price) * 100
         profit = market_value - asking_price
         
@@ -459,24 +492,7 @@ def master_agent(listings: List[Dict[str, str]]) -> List[Dict[str, Any]]:
 
 
 if __name__ == "__main__":
-    # Test the multi-agent system
-    test_listings = [
-        {"url": "https://example.com/listing/1", "id": "L001"},
-        {"url": "https://example.com/listing/2", "id": "L002"},
-    ]
-    
-    results = master_agent(test_listings)
-    
-    print("\n" + "="*60)
-    print("MULTI-AGENT PROCESSING COMPLETE")
-    print("="*60)
-    
-    for result in results:
-        print(f"\nListing: {result['listing_id']}")
-        print(f"Status: {'✓ Success' if not result['error'] else '✗ Error'}")
-        if result['output']:
-            print(result['output'])
-        if result['agent_logs']:
-            print("\nAgent Execution Log:")
-            for log in result['agent_logs']:
-                print(f"  {log}")
+    raise SystemExit(
+        "agents.py is intended to be imported by the production runner. "
+        "Provide real listing URLs and a valid Anthropic API key."
+    )
