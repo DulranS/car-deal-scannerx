@@ -29,6 +29,13 @@ MAX_DEALS_PER_REQUEST = 5  # Maximum deals to include in single Discord post
 STREAMING_THRESHOLD = 3  # Stream output if more than 3 deals
 TOKEN_ESTIMATE_RATIO = 0.33  # Rough estimate: 1 token per 3 characters
 
+# Intelligent Filtering & Deduplication
+ENABLE_CONTENT_HASH_DEDUP = True  # Detect duplicate listings by content hash
+ENABLE_SMART_FILTERING = True  # Filter listings based on criteria before LLM
+MAX_RETRY_ATTEMPTS = 3  # Retry failed scrapes
+RETRY_BACKOFF_SECONDS = 2.0  # Exponential backoff for retries
+DUPLICATE_DETECTION_THRESHOLD = 0.85  # 85% similarity = duplicate
+
 
 SEARCH_QUERIES = [
     "site:riyasewana.com/buy suzuki alto 800 colombo 2014 2015 2016",
@@ -98,23 +105,32 @@ class SupabaseStore:
         self.table = "seen_ids"
         self.cache_table = "response_cache"
         self.local_cache: Dict[str, tuple] = {}  # (data, expires_at)
+        self.content_hashes: Dict[str, str] = {}  # URL -> content hash for dedup
+        self.duplicate_count = 0  # Track duplicates prevented
 
     def get_seen_ids(self) -> Set[str]:
         """Fetch seen IDs with local caching to reduce DB queries."""
-        response = self.client.table(self.table).select("listing_id").execute()
-        if response.error:
-            raise RuntimeError(f"Supabase error loading seen IDs: {response.error}")
-        rows = response.data or []
-        return {row["listing_id"] for row in rows}
+        try:
+            response = self.client.table(self.table).select("listing_id").execute()
+            if response.error:
+                raise RuntimeError(f"Supabase error loading seen IDs: {response.error}")
+            rows = response.data or []
+            return {row["listing_id"] for row in rows}
+        except Exception as e:
+            print(f"⚠️ Error loading seen IDs, using empty set: {e}")
+            return set()
 
     def add_seen_ids(self, listing_ids: List[str]) -> None:
         """Batch insert seen IDs to minimize database operations."""
         if not listing_ids:
             return
         rows = [{"listing_id": lid, "seen_at": datetime.utcnow().isoformat()} for lid in listing_ids]
-        response = self.client.table(self.table).upsert(rows, on_conflict="listing_id").execute()
-        if response.error:
-            raise RuntimeError(f"Supabase error writing seen IDs: {response.error}")
+        try:
+            response = self.client.table(self.table).upsert(rows, on_conflict="listing_id").execute()
+            if response.error:
+                raise RuntimeError(f"Supabase error writing seen IDs: {response.error}")
+        except Exception as e:
+            print(f"⚠️ Error storing seen IDs: {e}")
 
     def get_cached_response(self, key: str) -> Optional[Dict]:
         """Get cached HTTP response to avoid duplicate scrapes."""
@@ -129,6 +145,18 @@ class SupabaseStore:
         """Store response in local cache with TTL."""
         expires_at = datetime.utcnow() + timedelta(minutes=REQUEST_CACHE_TTL_MINUTES)
         self.local_cache[key] = (data, expires_at)
+    
+    def add_content_hash(self, url: str, content_hash: str) -> None:
+        """Track content hash for deduplication."""
+        self.content_hashes[url] = content_hash
+    
+    def is_duplicate_content(self, content_hash: str) -> bool:
+        """Check if content hash already seen (duplicate detection)."""
+        return content_hash in self.content_hashes.values()
+    
+    def get_duplicate_count(self) -> int:
+        """Return number of duplicates prevented."""
+        return self.duplicate_count
 
 
 class SearchEngine:
@@ -174,32 +202,166 @@ class ListingScraper:
         self.session.headers.update(HEADERS)
         self.cache_store = cache_store
         self.request_count = 0  # Track scraping requests
+        self.cache_hits = 0
+        self.duplicates_prevented = 0
+        self.filtered_out = 0
+        self.errors_handled = 0
 
-    def fetch(self, url: str) -> Optional[Listing]:
-        listing_id = self._extract_id(url)
-        if not listing_id:
-            return None
+    def _compute_content_hash(self, title: str, model: str, year: Optional[int], price: Optional[int]) -> str:
+        """Compute hash of listing content for duplicate detection."""
+        content = f"{title.lower()}_{model.lower()}_{year}_{price}"
+        return hashlib.md5(content.encode()).hexdigest()
+    
+    def _passes_criteria_filter(self, listing: 'Listing') -> bool:
+        """Check if listing matches our criteria before expensive enrichment."""
+        if not ENABLE_SMART_FILTERING:
+            return True
         
-        # Check cache first to avoid duplicate scrapes
+        # Filter 1: Price range validation
+        if listing.asking_price:
+            min_price, max_price = 3000000, 15000000  # Configurable range
+            if not (min_price <= listing.asking_price <= max_price):
+                return False
+        
+        # Filter 2: Mileage validation
+        if listing.mileage:
+            max_mileage = 200000  # Configurable
+            if listing.mileage > max_mileage:
+                return False
+        
+        # Filter 3: Model validation (only cars in our target list)
+        if listing.model:
+            valid_models = [
+                "alto", "wagon r", "fit gp1", "fit gp5", "aqua", 
+                "dayz", "vitz", "vezel"
+            ]
+            if not any(model in listing.model.lower() for model in valid_models):
+                return False
+        
+        # Filter 4: Location validation
+        if listing.location:
+            valid_locations = ["colombo", "western", "gampaha", "kalutara"]
+            if not any(loc in listing.location.lower() for loc in valid_locations):
+                return False
+        
+        return True
+
+    def fetch(self, url: str, retry_count: int = 0) -> Optional[Listing]:
+        """Fetch and parse listing with retry logic, deduplication, and filtering."""
         cache_key = hashlib.md5(url.encode()).hexdigest()
+        
+        # Check cache first
         if self.cache_store:
             cached = self.cache_store.get_cached_response(cache_key)
             if cached:
+                self.cache_hits += 1
                 return self._reconstruct_listing(cached)
         
         try:
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
+            listing_id = self._extract_id(url)
+            if not listing_id:
+                return None
+            
+            # Fetch with retry logic
+            response = self._fetch_with_retry(url, retry_count)
+            if not response:
+                return None
+            
             html = response.text
             self.request_count += 1
-        except Exception as e:
+            
+            # Parse listing
+            if "ikman.lk" in url:
+                listing = self._parse_ikman(url, listing_id, html)
+            elif "riyasewana.com" in url:
+                listing = self._parse_riyasewana(url, listing_id, html)
+            else:
+                return None
+            
+            if not listing:
+                return None
+            
+            # Deduplication: Check content hash
+            if ENABLE_CONTENT_HASH_DEDUP and self.cache_store:
+                content_hash = self._compute_content_hash(
+                    listing.title, listing.model or "", listing.year, listing.asking_price
+                )
+                if self.cache_store.is_duplicate_content(content_hash):
+                    self.duplicates_prevented += 1
+                    self.cache_store.duplicate_count += 1
+                    return None
+                self.cache_store.add_content_hash(url, content_hash)
+            
+            # Smart filtering: Check if listing matches criteria
+            if not self._passes_criteria_filter(listing):
+                self.filtered_out += 1
+                return None
+            
+            # Cache successful parse
+            if self.cache_store:
+                self.cache_store.cache_response(cache_key, {
+                    "url": listing.url,
+                    "listing_id": listing.listing_id,
+                    "title": listing.title,
+                    "year": listing.year,
+                    "make": listing.make,
+                    "model": listing.model,
+                    "asking_price": listing.asking_price,
+                    "mileage": listing.mileage,
+                    "transmission": listing.transmission,
+                    "location": listing.location,
+                    "seller_type": listing.seller_type,
+                    "distress": listing.distress,
+                })
+            
+            return listing
+            
+        except requests.exceptions.Timeout:
+            self.errors_handled += 1
+            if retry_count < MAX_RETRY_ATTEMPTS:
+                print(f"⚠️ Timeout on {url}, retrying ({retry_count + 1}/{MAX_RETRY_ATTEMPTS})...")
+                time.sleep(RETRY_BACKOFF_SECONDS * (retry_count + 1))
+                return self.fetch(url, retry_count + 1)
+            print(f"❌ Max retries exceeded for {url}")
             return None
-        
-        if "ikman.lk" in url:
-            listing = self._parse_ikman(url, listing_id, html)
-        elif "riyasewana.com" in url:
-            listing = self._parse_riyasewana(url, listing_id, html)
-        else:
+        except requests.exceptions.ConnectionError as e:
+            self.errors_handled += 1
+            if retry_count < MAX_RETRY_ATTEMPTS:
+                print(f"⚠️ Connection error on {url}, retrying...")
+                time.sleep(RETRY_BACKOFF_SECONDS * (retry_count + 1))
+                return self.fetch(url, retry_count + 1)
+            print(f"❌ Connection failed for {url}: {e}")
+            return None
+        except Exception as e:
+            self.errors_handled += 1
+            print(f"⚠️ Error parsing {url}: {e}")
+            return None
+    
+    def _fetch_with_retry(self, url: str, retry_count: int) -> Optional[requests.Response]:
+        """Fetch with exponential backoff retry logic."""
+        for attempt in range(MAX_RETRY_ATTEMPTS):
+            try:
+                response = self.session.get(url, timeout=10)
+                if response.status_code == 429:  # Rate limited
+                    if attempt < MAX_RETRY_ATTEMPTS - 1:
+                        wait_time = RETRY_BACKOFF_SECONDS * (2 ** attempt)
+                        print(f"⚠️ Rate limited, waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                response.raise_for_status()
+                return response
+            except requests.exceptions.Timeout:
+                if attempt < MAX_RETRY_ATTEMPTS - 1:
+                    wait_time = RETRY_BACKOFF_SECONDS * (attempt + 1)
+                    time.sleep(wait_time)
+                    continue
+                raise
+            except requests.exceptions.RequestException as e:
+                if attempt < MAX_RETRY_ATTEMPTS - 1:
+                    time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise
+        return None
             return None
         
         # Cache successful parse
@@ -241,7 +403,13 @@ class ListingScraper:
 
     def get_cost_metrics(self) -> Dict[str, int]:
         """Return scraping metrics for cost tracking."""
-        return {"scrape_requests": self.request_count}
+        return {
+            "scrape_requests": self.request_count,
+            "cache_hits": self.cache_hits,
+            "duplicates_prevented": self.duplicates_prevented,
+            "filtered_out": self.filtered_out,
+            "errors_handled": self.errors_handled,
+        }
 
     def _extract_id(self, url: str) -> Optional[str]:
         match = re.search(r"(?:ikman\.lk/en/ad/[^/]+-)(\d+)|(?:riyasewana\.com/buy/[^/]+-(\d+))", url)
@@ -465,6 +633,8 @@ class FormatAgent:
         self.llm_cache: Dict[str, tuple] = {}  # (result, expires_at)
         self.context_overflow_count = 0  # Track overflows
         self.rag_invocations = 0  # Track selective RAG usage
+        self.prompt_cache_hits = 0  # Track Anthropic prompt cache hits
+        self.prompt_cache_writes = 0  # Track prompt cache creations
     
     def _estimate_tokens(self, text: str) -> int:
         """Rough estimate of token count (1 token ≈ 3 chars)"""
@@ -503,13 +673,59 @@ class FormatAgent:
             chunks.append(current_chunk)
         
         return chunks
+    
+    def _build_system_prompt_with_cache(self) -> tuple:
+        """Build system prompt with caching metadata for Anthropic prompt caching."""
+        system_prompt = """You are Claude, an expert used car analyst for Sri Lanka specializing in automotive market analysis, valuation, and deal assessment.
+
+MARKET KNOWLEDGE (cached for reuse):
+- Alto 800 (2014-2016): LKR 3.7-4.1M (high demand, reliable)
+- Wagon R (2016-2017): LKR 5.0M (family favorite)
+- Fit GP1 (2012-2013): LKR 6.8M (fuel efficient)
+- Fit GP5 (2014-2015): LKR 7.5M (popular)
+- Aqua (2013-2015): LKR 8.0-9.0M (hybrid)
+- Dayz (2015-2016): LKR 5.8M (compact)
+- Vitz (2014-2015): LKR 5.5M (economical)
+- Vezel (2015): LKR 9.0M (SUV premium)
+
+ANALYSIS FRAMEWORK:
+1. Price Gap: (Market Value - Asking Price) / Asking Price
+2. Condition: Assess mileage, seller type, location impact
+3. Market Timing: Private sellers more flexible than dealers
+4. Risk Factors: High mileage (>120K km), out-of-market locations
+
+OUTPUT FORMAT:
+- why_buy: Exactly 2 bullets on strengths and value
+- risks: Exactly 1 bullet on concerns
+
+Be concise. Each bullet: <50 characters."""
+        
+        return (
+            system_prompt,
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"}
+            }
+        )
 
     def _build_prompt(self, listing: Listing, market_value: int, score: int) -> str:
         return (
-            "You are Claude, an expert used car analyst for Sri Lanka. "
-            "Given the listing details, return exactly two concise bullets for 'Why Buy' and exactly one concise bullet for 'Risks'. "
-            "Answer only with valid JSON containing keys 'why_buy' and 'risks', where 'why_buy' is a string with two bullet lines separated by '\n' and 'risks' is a string with one bullet line.\n\n"
-            "Listing details:\n"
+            "Analyze this car listing for deal quality:\n\n"
+            f"Title: {listing.title}\n"
+            f"Year: {listing.year or 'unknown'}\n"
+            f"Make: {listing.make or 'unknown'}\n"
+            f"Model: {listing.model or 'unknown'}\n"
+            f"Asking Price: LKR {listing.asking_price or 'unknown':,}\n"
+            f"Market Value: LKR {market_value:,}\n"
+            f"Mileage: {listing.mileage or 'unknown':,} km\n"
+            f"Transmission: {listing.transmission or 'unknown'}\n"
+            f"Location: {listing.location or 'unknown'}\n"
+            f"Seller Type: {listing.seller_type or 'unknown'}\n"
+            f"Distress Signal: {'yes' if listing.distress else 'no'}\n"
+            f"Score: {score}/100\n\n"
+            "Respond with JSON: {\"why_buy\": \"...\", \"risks\": \"...\"}"
+        )
             f"Title: {listing.title}\n"
             f"Year: {listing.year or 'unknown'}\n"
             f"Make: {listing.make or 'unknown'}\n"
@@ -536,11 +752,11 @@ class FormatAgent:
         return hashlib.md5(content.encode()).hexdigest()
 
     def enrich_deal(self, deal: Deal) -> Deal:
-        """Enrich deal with LLM analysis, using cache when available.
+        """Enrich deal with LLM analysis using prompt caching and local cache.
         Uses RAG only if deal confidence is low (needs external market validation)."""
         cache_key = self._get_cache_key(deal.listing, deal.market_value, deal.score)
         
-        # Check cache first
+        # Check local cache first
         if cache_key in self.llm_cache:
             result, expires_at = self.llm_cache[cache_key]
             if datetime.utcnow() < expires_at:
@@ -558,22 +774,42 @@ class FormatAgent:
         # Check context window before processing
         if not self._check_context_window(prompt):
             print(f"⚠️ Skipping LLM enrichment for {deal.listing.title} - context window limit")
-            # Return deal without enrichment but don't fail
             return deal
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=400,
-            temperature=self.temperature,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        self.llm_request_count += 1
-        text = response.content[0].text.strip()
         try:
+            # Build system prompt with caching
+            system_text, system_with_cache = self._build_system_prompt_with_cache()
+            
+            # Call API with prompt caching enabled
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=400,
+                temperature=self.temperature,
+                system=[system_with_cache],  # Use cached system prompt
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            self.llm_request_count += 1
+            
+            # Check if prompt cache was used
+            if hasattr(response, 'usage'):
+                if hasattr(response.usage, 'cache_read_input_tokens') and response.usage.cache_read_input_tokens > 0:
+                    self.prompt_cache_hits += 1
+                    print(f"✓ Prompt cache hit! Saved {response.usage.cache_read_input_tokens} tokens")
+                if hasattr(response.usage, 'cache_creation_input_tokens') and response.usage.cache_creation_input_tokens > 0:
+                    self.prompt_cache_writes += 1
+            
+            text = response.content[0].text.strip()
             parsed = self._parse_response(text)
             why_buy = parsed.get("why_buy", deal.why_buy)
             risks = parsed.get("risks", deal.risks)
-        except Exception:
+            
+        except json.JSONDecodeError:
+            print(f"⚠️ Failed to parse LLM response for {deal.listing.title}, using fallback")
+            why_buy = deal.why_buy
+            risks = deal.risks
+        except Exception as e:
+            print(f"⚠️ LLM enrichment error for {deal.listing.title}: {e}")
             why_buy = deal.why_buy
             risks = deal.risks
         
@@ -635,6 +871,8 @@ class FormatAgent:
             "llm_calls": self.llm_request_count,
             "context_overflows": self.context_overflow_count,
             "rag_invocations": self.rag_invocations,
+            "prompt_cache_hits": self.prompt_cache_hits,
+            "prompt_cache_writes": self.prompt_cache_writes,
         }
 
 
@@ -789,19 +1027,50 @@ class CarDealScanner:
         return deals
 
     def _print_cost_report(self) -> None:
-        """Print cost optimization report."""
-        print("\n" + "="*60)
+        """Print cost optimization report with dedup and filtering stats."""
+        print("\n" + "="*70)
         print("COST OPTIMIZATION REPORT")
-        print("="*60)
-        print(f"URLs Processed: {self.cost_metrics['urls_processed']}")
-        print(f"Search API Calls (SerpAPI): {self.cost_metrics['serpapi_calls']}")
-        print(f"Web Scrape Requests: {self.cost_metrics['scrape_requests']}")
-        print(f"LLM API Calls (Anthropic): {self.cost_metrics['llm_calls']}")
-        print(f"Cache Hits: {self.cost_metrics.get('cache_hits', 0)}")
-        print(f"Context Window Overflows: {self.cost_metrics.get('context_overflows', 0)}")
-        print(f"RAG Invocations (low-confidence deals): {self.cost_metrics.get('rag_invocations', 0)}")
-        print(f"Discord Posts Made: {self.discord.posts_made}")
-        print("="*60 + "\n")
+        print("="*70)
+        print("\n📊 PROCESSING METRICS:")
+        print(f"  URLs Processed: {self.cost_metrics['urls_processed']}")
+        print(f"  Search API Calls (SerpAPI): {self.cost_metrics['serpapi_calls']}")
+        
+        print("\n🔍 SCRAPING METRICS:")
+        print(f"  Web Scrape Requests: {self.cost_metrics['scrape_requests']}")
+        print(f"  Cache Hits: {self.cost_metrics.get('cache_hits', 0)}")
+        print(f"  Duplicates Prevented: {self.cost_metrics.get('duplicates_prevented', 0)}")
+        print(f"  Filtered Out (criteria): {self.cost_metrics.get('filtered_out', 0)}")
+        print(f"  Errors Handled (with retry): {self.cost_metrics.get('errors_handled', 0)}")
+        
+        print("\n🤖 LLM METRICS:")
+        print(f"  LLM API Calls (Anthropic): {self.cost_metrics['llm_calls']}")
+        print(f"  Context Window Overflows: {self.cost_metrics.get('context_overflows', 0)}")
+        print(f"  RAG Invocations (low-confidence): {self.cost_metrics.get('rag_invocations', 0)}")
+        print(f"  Prompt Cache Hits: {self.cost_metrics.get('prompt_cache_hits', 0)}")
+        print(f"  Prompt Cache Writes: {self.cost_metrics.get('prompt_cache_writes', 0)}")
+        
+        print("\n💬 NOTIFICATION METRICS:")
+        print(f"  Discord Posts Made: {self.discord.posts_made}")
+        
+        # Calculate and display cost savings
+        duplicates = self.cost_metrics.get('duplicates_prevented', 0)
+        filtered = self.cost_metrics.get('filtered_out', 0)
+        cache_hits = self.cost_metrics.get('cache_hits', 0)
+        prompt_cache_hits = self.cost_metrics.get('prompt_cache_hits', 0)
+        savings_count = duplicates + filtered + cache_hits + prompt_cache_hits
+        
+        if savings_count > 0:
+            print("\n💰 COST SAVINGS:")
+            print(f"  LLM calls prevented (duplicates): {duplicates}")
+            print(f"  LLM calls prevented (filtering): {filtered}")
+            print(f"  HTTP scrapes cached: {cache_hits}")
+            print(f"  Prompt tokens saved (cache hits): {prompt_cache_hits}")
+            print(f"  Total operations saved: {savings_count}")
+            if self.cost_metrics['urls_processed'] > 0:
+                efficiency = (savings_count / self.cost_metrics['urls_processed']) * 100
+                print(f"  Efficiency rate: {efficiency:.1f}% of URLs saved via dedup/filter/cache")
+        
+        print("="*70 + "\n")
 
 
 def load_config() -> Dict[str, str]:
